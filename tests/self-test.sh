@@ -542,13 +542,17 @@ route_log="$(mktemp)"
 has() { [[ "$1" == ip ]]; }
 ROUTE_HOOK="$(mktemp)"
 ip() {
-  if [[ "$1 $2" == "route show" ]]; then printf '%s\n' "$ROUTE_SPEC"; return 0; fi
-  if [[ "$1 $2" == "route replace" ]]; then shift 2; local IFS=' '; printf '%s\n' "$*" >> "$route_log"; return 0; fi
+  local fam=-4 spec
+  if [[ "$1" == -4 || "$1" == -6 ]]; then fam="$1"; shift; fi
+  if [[ "$fam" == -6 ]]; then spec="${ROUTE6_SPEC:-}"; else spec="$ROUTE_SPEC"; fi
+  if [[ "$1 $2" == "route show" ]]; then [[ -z "$spec" ]] || printf '%s\n' "$spec"; return 0; fi
+  if [[ "$1 $2" == "route replace" ]]; then shift 2; local IFS=' '; printf '%s %s\n' "$fam" "$*" >> "$route_log"; return 0; fi
   return 0
 }
+ROUTE6_SPEC=''
 ROUTE_SPEC='default via 10.0.0.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32'
 clear_initcwnd >/dev/null 2>&1
-assert_eq 'default via 10.0.0.1 dev eth0 proto dhcp metric 100' "$(cat "$route_log")" \
+assert_eq '-4 default via 10.0.0.1 dev eth0 proto dhcp metric 100' "$(cat "$route_log")" \
   'switching to landing strips initcwnd and initrwnd from the default route'
 [[ ! -e "$ROUTE_HOOK" ]] || fail 'the networkd hook must be removed too'
 pass 'the initcwnd route hook is removed as well'
@@ -556,6 +560,36 @@ pass 'the initcwnd route hook is removed as well'
 ROUTE_SPEC='default via 10.0.0.1 dev eth0 proto dhcp metric 100'
 clear_initcwnd >/dev/null 2>&1
 assert_eq '' "$(cat "$route_log")" 'a route without initcwnd is left alone'
+
+# Dual stack. Field capture on the DE relay: upstream legs ran over IPv6 while
+# initcwnd sat on the IPv4 route only, so they started from the kernel's 10.
+INITCWND=32
+ROUTE_SPEC='default via 10.0.0.1 dev eth0 proto dhcp metric 100'
+ROUTE6_SPEC='default via 2a12:8d02::1 dev eth0 metric 1024 pref medium'
+: > "$route_log"
+apply_initcwnd eth0 >/dev/null 2>&1
+assert_eq '-4 default via 10.0.0.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32
+-6 default via 2a12:8d02::1 dev eth0 metric 1024 pref medium initcwnd 32 initrwnd 32' \
+  "$(cat "$route_log")" 'initcwnd lands on both the IPv4 and the static IPv6 default route'
+grep -q 'for FAM in -4 -6' "$ROUTE_HOOK" || fail 'route hook should reapply both families'
+pass 'the route hook reapplies initcwnd on both families'
+: > "$route_log"
+ROUTE6_SPEC='default via fe80::1 dev eth0 proto ra metric 1024 expires 1790sec hoplimit 64 pref medium'
+apply_initcwnd eth0 >/dev/null 2>&1
+assert_eq '-4 default via 10.0.0.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32' \
+  "$(cat "$route_log")" 'a router-advertised IPv6 default is never pinned with replace'
+: > "$route_log"
+ROUTE6_SPEC='default via 2a12:8d02::1 dev eth0 proto static metric 1024 expires 600sec pref medium initcwnd 32 initrwnd 32'
+ROUTE_SPEC='default via 10.0.0.1 dev eth0 proto dhcp metric 100'
+clear_initcwnd >/dev/null 2>&1
+assert_eq '-6 default via 2a12:8d02::1 dev eth0 proto static metric 1024 pref medium' "$(cat "$route_log")" \
+  'clearing strips the IPv6 window options and the unparseable expires token'
+: > "$route_log"
+ROUTE6_SPEC='default via 2a12:8d02::1 dev eth1 metric 1024'
+apply_initcwnd eth0 >/dev/null 2>&1
+assert_eq '-4 default via 10.0.0.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32' \
+  "$(cat "$route_log")" 'an IPv6 default on another interface is left alone'
+ROUTE6_SPEC=''
 rm -f "$route_log"
 
 # ── 落地鸡：set_landing 的最终状态 ────────────────────────────────────────
